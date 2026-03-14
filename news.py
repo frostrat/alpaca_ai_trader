@@ -80,3 +80,279 @@ def fetch_finnhub_news(sectors=None) -> list:
     except Exception as e:
         log.error(f"Finnhub fetch failed: {e}")
         return []  # if theres an error this will print vs crashing the program.
+
+
+# ============================================================
+# Alpha vantage news Fetcher
+# ============================================================
+
+
+def fetch_alphavantage_news(sectors=None) -> list:
+    """
+    Fetch sector-based news from Alpha Vantage.
+    Returns a list of article dicts with sentiment scores.
+    """
+    if not config.ALPHAVANTAGE_API_KEY:
+        log.error(
+            "ALPHAVANTAGE_API_KEY not set"
+        )  # same cant find api key warning as before
+        return []
+
+    if sectors is None:
+        sectors = (
+            config.SECTORS
+        )  # if no sectors were passed in use the 3 specified in config.py
+
+    # Alpha uses specific topic names
+    topic_map = {
+        "Technology": "technology",  # "translation dictionary" the config names "healthcare" but AlphaVantages api expects "life_sciences"
+        "Energy": "energy",  # just maps our names to their names - can add on more sectors later.
+        "Healthcare": "life_sciences",
+    }
+
+    all_articles = []  # empty list that will fill with articles from all 3 sectors, unlike finhub this function makes multiple
+    # requests, 1 per sector
+
+    for sector in sectors:
+        topic = topic_map.get(
+            sector, sector.lower()
+        )  # loops through each sector. fallback is just in case a sector isn't in the map as it lowercases it and hopes it works
+        # references our translation dictionary !!
+        try:
+            response = requests.get(
+                "https://www.alphavantage.co/query",
+                params={
+                    "function": "NEWS_SENTIMENT",
+                    "topics": topic,
+                    "limit": 10,
+                    "apikey": config.ALPHAVANTAGE_API_KEY,
+                },
+                timeout=10,  # request timeout
+            )
+
+            if response.status_code != 200:
+                log.warning(
+                    f"AlphaVantage HTTP {response.status_code} for {sector}"
+                )  # same http response code print
+                continue
+
+            data = (
+                response.json()
+            )  # takes raw http response and converts into a py dictionary
+
+            feed = data.get(
+                "feed", []
+            )  # reaches into the dictionary and grabs just the list of articles
+            #   ^ if feed doesnt exist we get an empty list.
+            for item in feed:
+                title = item.get("title", "")
+                if not title:
+                    continue
+                all_articles.append(
+                    {
+                        "title": title,
+                        "source": item.get("source", ""),
+                        "summary": item.get("summary", "")[:200],
+                        "published": item.get("time_published", ""),
+                        "sentiment": item.get("overall_sentiment_label", ""),
+                        "sentiment_score": item.get(
+                            "overall_sentiment_score", 0
+                        ),  # sentiment score from av news
+                        "sector": sector,
+                        "url": item.get("url", ""),
+                    }
+                )
+
+            log.info(
+                f"AlphaVantage: fetched {len(feed)} articles for {sector}"
+            )  # logs how many articles
+
+        except Exception as e:
+            log.error(f"AlphaVantage fetch failed for {sector}: {e}")  # catches crashes
+
+    return all_articles  # return full combined list.
+
+
+# ============================================================
+# Combined news fetch
+# ============================================================
+
+
+def fetch_all_news(sectors=None) -> dict:  # fetches and puts in one dict with two keys
+    """
+    Fetch from both sources and combine into one dict.
+    Returns: { "finnhub": [...], "alphavantage": [...] }
+    """
+    finnhub = fetch_finnhub_news()
+    alphavantage = fetch_alphavantage_news(sectors)
+
+    return {
+        "finnhub": finnhub,
+        "alphavantage": alphavantage,
+    }
+
+
+def save_news(news: dict):
+    """Save combined news to cache file!!!"""
+    data = {
+        "fetched_at": datetime.now().astimezone().isoformat(),
+        "news": news,
+    }
+    with open(NEWS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    log.info(f"News saved to {NEWS_FILE}")
+
+
+def load_news() -> dict:
+    """Load news from cache, other parts of the bot use this to get cached news without re-fetching"""
+    try:
+        with open(NEWS_FILE, "r") as f:
+            data = json.load(f)
+        return data.get("news", {})
+    except FileNotFoundError:
+        return {}
+
+
+# ============================================================
+# claude analysis ->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# ============================================================
+
+
+def analyze_with_claude(
+    news: dict,
+) -> dict:  # takes the combined news dict  and returns claudes analysis as a dict.
+    """
+    Send combined news to Claude for sector sentiment analysis.
+    Returns: { "Technology": { "sentiment": "bullish", ... }, ... }
+    """
+    finnhub = news.get("finnhub", [])
+    alphavantage = news.get("alphavantage", [])
+    # Pull out both article lists and count them. If we got
+    total = len(finnhub) + len(
+        alphavantage
+    )  # zero articles from both sources, don't waste an API call, just return empty.
+    if total == 0:
+        log.warning("No news to analyze")
+        return {}
+
+    if not config.ANTHROPIC_API_KEY:
+        log.error("ANTHROPIC_API_KEY not set")  # key check
+        return {}
+
+    # build news text for the prompt, claude will read this!
+    news_text = "\n### General Market News (Finnhub)\n"
+    for a in finnhub[:10]:  # first section is the 10 finnhub articles
+        news_text += f"- [{a['source']}] {a['title']}\n"
+
+    for sector in config.SECTORS:  # second is the 10 AV articles.
+        sector_articles = [
+            a for a in alphavantage if a.get("sector") == sector
+        ]  # this loop cycles through ea sector
+        news_text += f"\n### {sector} Sector News (Alpha Vantage)\n"
+        if not sector_articles:
+            news_text += "No recent news.\n"
+        else:
+            for a in sector_articles:
+                av_sentiment = a.get(
+                    "sentiment", ""
+                )  # factor in the auto news sentiment given from AV
+                news_text += (
+                    f"- [{a['source']}] {a['title']} (AV sentiment: {av_sentiment})\n"
+                )
+
+    prompt = f"""You are a stock market analyst. Analyze the following news for each sector and the general market.   
+
+Your goal is to achieve {config.MONTHLY_PROFIT_TARGET * 100:.0f}% portfolio growth per month. Pick sectors and stocks that have the best probability of reaching this target. Don't force trades if the setups aren't there. Missing the target is better than losing money chasing it.
+
+For each sector, provide:
+1. Overall sentiment: bullish, bearish, or neutral
+2. Confidence score: 0.0 to 1.0
+3. A 2-3 sentence summary of key themes
+4. Top stock ticker to watch in this sector based on the news
+
+Respond ONLY with JSON, no markdown, no extra text:
+{{
+  "market_overview": {{
+    "sentiment": "bullish/bearish/neutral",
+    "confidence": 0.0 to 1.0,
+    "summary": "..."
+  }},
+  "Technology": {{
+    "sentiment": "bullish/bearish/neutral",
+    "confidence": 0.0 to 1.0,
+    "summary": "...",
+    "top_ticker": "AAPL"
+  }},
+  "Energy": {{
+    "sentiment": "bullish/bearish/neutral",
+    "confidence": 0.0 to 1.0,
+    "summary": "...",
+    "top_ticker": "XOM"
+  }},
+  "Healthcare": {{
+    "sentiment": "bullish/bearish/neutral",
+    "confidence": 0.0 to 1.0,
+    "summary": "...",
+    "top_ticker": "UNH"
+  }}
+}}
+
+NEWS:
+{news_text}
+"""
+    # ^ just telling claude his job and the way he should respond. tickers arent hardcoded allowing for the top companies to be picked.
+    try:
+        response = requests.post(  # POST request- sending claude a prompt.
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": config.ANTHROPIC_API_KEY,  # headers- metadata that goes with the request. xapi is auth, and anthropic vers tells the api which
+                "anthropic-version": "2023-06-01",  # ver to use.
+                "content-type": "application/json",  # says "Im sending you JSON"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 1000,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],  # same as in the .messages documentation for anthropic api-
+            },
+            timeout=30,
+        )
+
+        data = response.json()  # parse claudes respons
+
+        if "error" in data:
+            log.error(
+                f"Claude API error: {data['error'].get('message', 'unknown')}"
+            )  # errors (bad key, no credits,...)
+            return {}
+
+        if "content" not in data or not data["content"]:
+            log.error(
+                f"Unexpected Claude response: {json.dumps(data)[:500]}"
+            )  # catches if response isnt correct, not an error but also not right.
+            return {}
+
+        raw = data["content"][0][
+            "text"
+        ].strip()  # get rid of extra crud when printing a response
+
+        if raw.startswith("```"):  # more to help with JSON formatting craziness
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+
+        analysis = json.loads(raw)  # converting json string into a py dictionary
+        log.info("Claude sector analysis complete")
+        return analysis
+
+    except json.JSONDecodeError as e:
+        log.error(f"Failed to parse Claude response: {e}")
+        return {}
+    except Exception as e:
+        log.error(f"Claude API call failed: {e}")
+        return {}
+
+
+# catches errors, invalid JSON, markdown stipping failed, network timeouts, connection errors, ...

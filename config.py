@@ -33,6 +33,7 @@ PCT_TRAIL_THRESHOLD = 0.5  # when a position is up 50% or more, the trailing sto
 # So if you're up 50% on a stock, it starts protecting those gains more aggressively.
 PCT_TRAIL_AMOUNT = 0.20  # once that percentage trail kicks in, the stop trails 20%
 # below the peak price. So if a stock hits $300 peak, your stop moves to $240.
+MONTHLY_PROFIT_TARGET = 0.10  # Target 10% monthly return
 
 # ============================================================
 # ALLOCATION
