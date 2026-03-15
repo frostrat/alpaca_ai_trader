@@ -268,6 +268,8 @@ For each sector, provide:
 3. A 2-3 sentence summary of key themes
 4. Top stock ticker to watch in this sector based on the news
 
+Keep all summaries under 50 words. Be concise.
+
 Respond ONLY with JSON, no markdown, no extra text:
 {{
   "market_overview": {{
@@ -309,7 +311,7 @@ NEWS:
             },
             json={
                 "model": "claude-sonnet-4-20250514",
-                "max_tokens": 2000,
+                "max_tokens": 4000,
                 "messages": [
                     {"role": "user", "content": prompt}
                 ],  # same as in the .messages documentation for anthropic api-

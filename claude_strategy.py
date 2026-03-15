@@ -26,7 +26,9 @@ log = logging.getLogger("StockBot")
 
 CLAUDE_SIGNAL_FILE = "claude_signals.json"
 TRADE_HISTORY_FILE = "claude_trade_history.json"
-MAX_TRADE_HISTORY = 20
+MAX_TRADE_HISTORY = 20  # trade history size mentioned in claudes memory section !!!
+# started on 20 as its a good balance to see patterns but not get the prompt bloated with info.
+# can change this if you want as its not hardcoded below.
 
 
 class ClaudeStrategy:
@@ -176,7 +178,7 @@ class ClaudeStrategy:
     # helper methods supporting main analysis ->
 
     def _get_tickers_from_news(self, news_analysis) -> list:
-        """Pull the top tickers Claude picked from news analysis."""
+        """reads news analysis and pulls out top company in ea sector."""
         tickers = []
         for sector in config.SECTORS:
             data = news_analysis.get(sector, {})
@@ -186,14 +188,14 @@ class ClaudeStrategy:
         return tickers
 
     def _format_indicators(self, symbol, row, news_analysis) -> dict:
-        """Format one stock's indicators into a clean dict for Claude."""
+        """takes one rwo of indicator data and packages into clean dict"""
 
         def safe(val, decimals=2):
             if pd.isna(val):
                 return None
             return round(float(val), decimals)
 
-        # Find which sector this stock belongs to
+        # find which sector this stock belongs to via matching back to news analysis
         sector = "Unknown"
         for s in config.SECTORS:
             data = news_analysis.get(s, {})
@@ -201,6 +203,7 @@ class ClaudeStrategy:
                 sector = s
                 break
 
+        # package of data Claude gets for one stock ->
         return {
             "symbol": symbol,
             "sector": sector,
@@ -221,3 +224,306 @@ class ClaudeStrategy:
             "mom_10d": safe(row.get("mom_10d"), 4),
             "mom_20d": safe(row.get("mom_20d"), 4),
         }
+
+    # ============================================================
+    # prompt builder
+    # ============================================================
+
+    def _build_prompt(self, snapshots, news_analysis, trade_history) -> str:
+        """Build the full chained analysis prompt."""
+        data_text = json.dumps(snapshots, indent=2)
+
+        # format the inputs: take raw data and format into readble text for claude.
+        news_text = ""
+        overview = news_analysis.get("market_overview", {})
+        news_text += f"Market Overview: {overview.get('sentiment', 'N/A')} ({overview.get('confidence', 0):.0%})\n"
+        news_text += f"  {overview.get('summary', 'No overview available.')}\n"
+
+        for sector in config.SECTORS:
+            data = news_analysis.get(sector, {})
+            sentiment = data.get("sentiment", "N/A")
+            confidence = data.get("confidence", 0)
+            summary = data.get("summary", "")
+            ticker = data.get("top_ticker", "N/A")
+            news_text += (
+                f"\n{sector}: {sentiment} ({confidence:.0%}) — Pick: {ticker}\n"
+            )
+            news_text += f"  {summary}\n"
+
+        # format trade history
+        history_text = "No previous trades."
+        if trade_history:
+            history_text = json.dumps(trade_history, indent=2)
+
+        return f"""You are a stock trading analyst managing a real portfolio on Alpaca. You receive:
+1. News sentiment analysis per sector (already analyzed)
+2. Technical indicators for the top stock in each sector
+3. Current position information
+4. Recent trade history (your past decisions and outcomes)
+
+ANALYZE IN THIS ORDER:
+Step 1: Review the news sentiment and market overview.
+Step 2: Check if the technicals CONFIRM the news sentiment for each stock.
+Step 3: Review positions and trade history for context.
+Step 4: Make your final decision per stock.
+
+ACTIONS (one per stock):
+- BUY: NOT holding. Technicals confirm bullish news. Strong setup.
+- WAIT: NOT holding. Setup isn't clear enough. This is the safe default.
+- HOLD: Already holding. Position is healthy.
+- SELL: Already holding. Breakdown or major negative catalyst.
+
+RULES:
+- You are a swing trader on DAILY candles. Positions last days to weeks.
+- If NOT holding: only BUY or WAIT.
+- If ALREADY holding: only HOLD or SELL.
+- Your portfolio target is {config.MONTHLY_PROFIT_TARGET * 100:.0f}% monthly growth.
+- FEES: Alpaca is commission-free. But still don't chase small moves under 3%.
+- BUY requires: RSI not overbought (under 65), price showing trend support, ADX > 18, and bullish news. If BB %B > 0.85, do NOT buy.
+- SELL requires: major technical breakdown OR high-confidence negative news.
+- WAIT is always safer than a bad BUY.
+- Learn from trade history. If similar setups lost money before, be cautious.
+- Confidence = how strongly ALL signals align (0.0 = none, 1.0 = everything aligns).
+
+INDICATOR GUIDE:
+- RSI < 30 = oversold (potential buy), RSI > 70 = overbought (avoid)
+- RSI 60-70 = getting hot, be cautious
+- MACD histogram > 0 and rising = bullish momentum
+- Price above EMA 200 = long-term uptrend
+- ADX > 20 = strong trend, ADX < 20 = choppy (avoid new entries)
+- BB %B > 0.8 = near upper band (overbought), < 0.2 = oversold
+- Volume ratio > 1.3 = high volume confirms the move
+
+NEWS SENTIMENT:
+{news_text}
+
+TECHNICAL DATA + POSITIONS:
+{data_text}
+
+TRADE HISTORY:
+{history_text}
+
+Respond ONLY with JSON, no markdown, no extra text. Use the stock ticker as the key:
+{{
+  "TICKER1": {{
+    "action": "buy/wait/hold/sell",
+    "confidence": 0.0 to 1.0,
+    "reasoning": "2-3 sentences: technicals + news alignment + decision"
+  }},
+  "TICKER2": {{
+    "action": "buy/wait/hold/sell",
+    "confidence": 0.0 to 1.0,
+    "reasoning": "..."
+  }},
+  "TICKER3": {{
+    "action": "buy/wait/hold/sell",
+    "confidence": 0.0 to 1.0,
+    "reasoning": "..."
+  }}
+}}"""
+
+    # ============================================================
+    # claude api call
+    # ============================================================
+
+    def _call_claude(self, prompt, verbose=True) -> dict:
+        """send prompt to Claude and parse response."""
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": config.ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 2000,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30,  # wait upto 30 seconds
+            )
+
+            data = response.json()  # error checking ->
+
+            if "error" in data:
+                log.error(
+                    f"Claude API error: {data['error'].get('message', 'unknown')}"
+                )
+                return {}
+
+            if "content" not in data or not data["content"]:
+                log.error(f"Unexpected Claude response: {json.dumps(data)[:500]}")
+                return {}
+
+            raw = data["content"][0]["text"].strip()  # response clean up ->
+
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
+
+            signals = json.loads(raw)
+            log.info("Claude trade analysis complete")
+
+            # verbose logging - loop through ea stocks decision. If verbose = True (30 min check)
+            # everything will print. if Verbose = False (5min check) doesnt print anything.
+            for symbol, decision in signals.items():
+                action = decision.get("action", "?").upper()
+                conf = decision.get("confidence", 0)
+                reasoning = decision.get("reasoning", "")
+                if verbose or action in ["BUY", "SELL"]:
+                    log.info(
+                        f"  Claude [{symbol}]: {action} ({conf:.0%}) — {reasoning}"
+                    )
+
+            return signals
+
+        except json.JSONDecodeError as e:  # more error catching ->
+            log.error(f"Failed to parse Claude response: {e}")
+            return {}
+        except Exception as e:
+            log.error(f"Claude API call failed: {e}")
+            return {}
+
+    # ============================================================
+    # trade history // claudes memory
+    # ============================================================
+
+    def record_trade(
+        self, symbol, side, entry_price, exit_price, pnl_pct, strategy, reason
+    ):
+        """Save a completed trade to Claude's memory."""
+        history = self._load_trade_history()
+
+        """when a trade closes, this gets called- loads whaterver trades are already saved->
+        appends new trade as a dictionary w/ the details. 
+        
+        Keeps only the last 20 trades so file doesnt grow forever. """
+
+        history.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "entry_price": round(entry_price, 2),
+                "exit_price": round(exit_price, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "strategy": strategy,
+                "exit_reason": reason,
+                "time": datetime.now().astimezone().isoformat(),
+            }
+        )
+
+        history = history[-MAX_TRADE_HISTORY:]
+
+        try:  # writes trade list to ...._history.json. Claudes long-term memory.
+            with open(TRADE_HISTORY_FILE, "w") as f:
+                json.dump({"trades": history}, f, indent=2)
+        except Exception as e:
+            log.error(f"Failed to save trade history: {e}")
+
+    def _load_trade_history(self) -> list:  # reads the trade history back.
+        """Load recent trades for Claude's context."""
+        try:
+            with open(TRADE_HISTORY_FILE, "r") as f:
+                data = json.load(f)
+            return data.get("trades", [])
+        except FileNotFoundError:  # handles first run when no file exists yet.
+            return []
+        except Exception as e:
+            log.error(f"Failed to load trade history: {e}")
+            return []
+
+    # ============================================================
+    # persistance
+    # ============================================================
+
+    def _save_signals(self, signals):
+        """claudes decisions are saved here with a timestamp. -every 5 min cycle reads from this."""
+        data = {
+            "analyzed_at": datetime.now().astimezone().isoformat(),
+            "signals": signals,
+        }
+        try:
+            with open(CLAUDE_SIGNAL_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            log.error(f"Failed to save signals: {e}")
+
+    def _load_signals(self):
+        """load cached signals."""
+        try:
+            with open(CLAUDE_SIGNAL_FILE, "r") as f:
+                data = json.load(f)
+            self._signals = data.get("signals", {})
+            analyzed = data.get("analyzed_at", "unknown")
+            log.info(f"Loaded Claude signals from {analyzed}")
+        except FileNotFoundError:
+            self._signals = {}
+        except Exception as e:
+            log.error(f"Failed to load signals: {e}")
+            self._signals = {}
+
+
+# =======================================
+# testterrrr
+# =======================================
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+
+    from exchange import ExchangeClient
+    from indicators import compute_indicators
+    from news import run_news_cycle
+
+    print("\n--- Claude Stock Strategy Test ---")
+
+    # Step 1: run news cycle first (feeds the chain)
+    print("Fetching news and running sentiment analysis...")
+    news_analysis = run_news_cycle()
+
+    if not news_analysis:
+        print("News cycle failed. Check API keys.")
+        exit()
+
+    # Step 2: Get the tickers Claude picked from news
+    strategy = ClaudeStrategy()
+    tickers = strategy._get_tickers_from_news(news_analysis)
+    print(f"Claude picked: {tickers}")
+
+    # Step 3: Fetch market data for those tickers
+    print("Fetching market data...")
+    exchange = ExchangeClient()
+    market_data = {}
+
+    for symbol in tickers:
+        df = exchange.fetch_bars(symbol)
+        if not df.empty and len(df) > 50:
+            df = compute_indicators(df)
+            market_data[symbol] = df
+            price = df["close"].iloc[-1]
+            print(f"  {symbol}: ${price:,.2f}")
+        else:
+            print(f"  {symbol}: no data")
+
+    # Step 4: Get positions from Alpaca
+    positions = exchange.get_positions()
+
+    # Step 5: run the full chained analysis
+    print("\nRunning Claude analysis...")
+    signals = strategy.run_analysis(market_data, positions=positions)
+
+    if signals:
+        print("\n========== CLAUDE TRADE SIGNALS ==========")
+        for symbol, data in signals.items():
+            action = data.get("action", "?").upper()
+            conf = data.get("confidence", 0)
+            reasoning = data.get("reasoning", "")
+            print(f"\n  {symbol}: {action} ({conf:.0%})")
+            print(f"    {reasoning}")
+        print("==========================================\n")
+    else:
+        print("\nNo signals generated. Check API keys.")
