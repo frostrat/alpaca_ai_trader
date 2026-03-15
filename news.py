@@ -89,7 +89,7 @@ def fetch_finnhub_news(sectors=None) -> list:
 
 def fetch_alphavantage_news(sectors=None) -> list:
     """
-    Fetch sector-based news from Alpha Vantage.
+    Fetch sector-based news from Alpha Vantage in a single API call.
     Returns a list of article dicts with sentiment scores.
     """
     if not config.ALPHAVANTAGE_API_KEY:
@@ -106,71 +106,69 @@ def fetch_alphavantage_news(sectors=None) -> list:
     # Alpha uses specific topic names
     topic_map = {
         "Technology": "technology",  # "translation dictionary" the config names "healthcare" but AlphaVantages api expects "life_sciences"
-        "Energy": "energy",  # just maps our names to their names - can add on more sectors later.
+        "Energy": "energy_transportation",  # just maps our names to their names - can add on more sectors later.
         "Healthcare": "life_sciences",
     }
 
-    all_articles = []  # empty list that will fill with articles from all 3 sectors, unlike finhub this function makes multiple
-    # requests, 1 per sector
+    # Combine all sector topics into one comma-separated string
+    topics = ",".join(
+        topic_map.get(s, s.lower()) for s in sectors
+    )  # one api call instead of original 3 due to api limits
 
-    for sector in sectors:
-        topic = topic_map.get(
-            sector, sector.lower()
-        )  # loops through each sector. fallback is just in case a sector isn't in the map as it lowercases it and hopes it works
-        # references our translation dictionary !!
-        try:
-            response = requests.get(
-                "https://www.alphavantage.co/query",
-                params={
-                    "function": "NEWS_SENTIMENT",
-                    "topics": topic,
-                    "limit": 10,
-                    "apikey": config.ALPHAVANTAGE_API_KEY,
-                },
-                timeout=10,  # request timeout
-            )
+    try:
+        response = requests.get(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": "NEWS_SENTIMENT",
+                "topics": topics,
+                "limit": 50,
+                "apikey": config.ALPHAVANTAGE_API_KEY,
+            },
+            timeout=10,
+        )
 
-            if response.status_code != 200:
-                log.warning(
-                    f"AlphaVantage HTTP {response.status_code} for {sector}"
-                )  # same http response code print
+        if response.status_code != 200:
+            log.warning(f"AlphaVantage HTTP {response.status_code}")
+            return []
+
+        data = response.json()
+        feed = data.get("feed", [])
+
+        all_articles = []
+        for item in feed:
+            title = item.get("title", "")
+            if not title:
                 continue
 
-            data = (
-                response.json()
-            )  # takes raw http response and converts into a py dictionary
+            # Figure out which sector this article belongs to
+            article_topics = [t.get("topic", "") for t in item.get("topics", [])]
+            sector = "General"
+            for s, t in topic_map.items():
+                if t in article_topics:
+                    sector = s
+                    break
 
-            feed = data.get(
-                "feed", []
-            )  # reaches into the dictionary and grabs just the list of articles
-            #   ^ if feed doesnt exist we get an empty list.
-            for item in feed:
-                title = item.get("title", "")
-                if not title:
-                    continue
-                all_articles.append(
-                    {
-                        "title": title,
-                        "source": item.get("source", ""),
-                        "summary": item.get("summary", "")[:200],
-                        "published": item.get("time_published", ""),
-                        "sentiment": item.get("overall_sentiment_label", ""),
-                        "sentiment_score": item.get(
-                            "overall_sentiment_score", 0
-                        ),  # sentiment score from av news
-                        "sector": sector,
-                        "url": item.get("url", ""),
-                    }
-                )
+            all_articles.append(
+                {
+                    "title": title,
+                    "source": item.get("source", ""),
+                    "summary": item.get("summary", "")[:200],
+                    "published": item.get("time_published", ""),
+                    "sentiment": item.get("overall_sentiment_label", ""),
+                    "sentiment_score": item.get("overall_sentiment_score", 0),
+                    "sector": sector,
+                    "url": item.get("url", ""),
+                }
+            )
 
-            log.info(
-                f"AlphaVantage: fetched {len(feed)} articles for {sector}"
-            )  # logs how many articles
+        log.info(
+            f"AlphaVantage: fetched {len(all_articles)} articles across all sectors"
+        )
+        return all_articles
 
-        except Exception as e:
-            log.error(f"AlphaVantage fetch failed for {sector}: {e}")  # catches crashes
-
-    return all_articles  # return full combined list.
+    except Exception as e:
+        log.error(f"AlphaVantage fetch failed: {e}")
+        return []
 
 
 # ============================================================
@@ -311,7 +309,7 @@ NEWS:
             },
             json={
                 "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1000,
+                "max_tokens": 2000,
                 "messages": [
                     {"role": "user", "content": prompt}
                 ],  # same as in the .messages documentation for anthropic api-
@@ -336,7 +334,7 @@ NEWS:
         raw = data["content"][0][
             "text"
         ].strip()  # get rid of extra crud when printing a response
-
+        log.info(f"Raw Claude response: {raw[:500]}")
         if raw.startswith("```"):  # more to help with JSON formatting craziness
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -356,3 +354,79 @@ NEWS:
 
 
 # catches errors, invalid JSON, markdown stipping failed, network timeouts, connection errors, ...
+
+
+def save_analysis(analysis: dict):
+    """save Claude's analysis to file."""
+    data = {
+        "analyzed_at": datetime.now().astimezone().isoformat(),
+        "analysis": analysis,
+    }
+    with open(ANALYSIS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    log.info(f"Analysis saved to {ANALYSIS_FILE}")
+
+
+def load_analysis() -> dict:
+    """load latest analysis from cache to read, other parts like strategy will use this to get claudes sector opinions"""
+    try:
+        with open(ANALYSIS_FILE, "r") as f:
+            data = json.load(f)
+        return data.get("analysis", {})
+    except FileNotFoundError:
+        return {}
+
+
+def run_news_cycle(sectors=None) -> dict:
+    """
+    full cycle: fetch news from both sources -> save -> Claude analysis -> save.
+    Returns the analysis dict
+    """
+    log.info("Starting news cycle...")
+
+    news = fetch_all_news(sectors=sectors)
+    save_news(news)
+
+    analysis = analyze_with_claude(news)
+    if analysis:
+        save_analysis(analysis)
+
+    return analysis
+
+
+# ============================================================
+# standalone test ->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# ============================================================
+
+# this is for if you run news.py directly !!!
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
+
+    print("\n--- News Module Test ---\n")
+
+    analysis = run_news_cycle()
+
+    if analysis:
+        print("\n========== CLAUDE SECTOR ANALYSIS ==========")
+
+        overview = analysis.get("market_overview", {})
+        print(
+            f"\nMARKET: {overview.get('sentiment', 'N/A').upper()} ({overview.get('confidence', 0):.0%})"
+        )
+        print(f"  {overview.get('summary', '')}")
+
+        for sector in config.SECTORS:
+            data = analysis.get(sector, {})
+            sentiment = data.get("sentiment", "N/A").upper()
+            confidence = data.get("confidence", 0)
+            summary = data.get("summary", "")
+            ticker = data.get("top_ticker", "N/A")
+            print(f"\n{sector}: {sentiment} ({confidence:.0%}) — Top pick: {ticker}")
+            print(f"  {summary}")
+
+        print("\n=============================================\n")
+    else:
+        print("No analysis generated. Check API keys.")
