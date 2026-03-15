@@ -50,9 +50,15 @@ PARTIAL_TAKE_SIZE = 0.30  # sell 30% of the position when taking profits
 TIMEFRAME = "1Day"
 CANDLE_HISTORY = 250
 CHECK_INTERVAL = 60  # 60 seconds between checks
-CLAUDE_ANALYSIS_HOURS = 0.5  # Re-evaluate every 30 min during market hours
-NEWS_REFRESH_HOURS = 4  # Fresh news every hour
 
+# ============================================================
+# ANALYSIS TIMING (during market hours)            #if you dont want to spend a $1-$2 a day on api calls I would change this.
+# ============================================================
+
+CLAUDE_QUICK_CHECK_MINS = 5  # Quick analysis every 5 min (only prints on trade)
+CLAUDE_FULL_PRINT_MINS = 30  # Full analysis printed every 30 min
+NEWS_REFRESH_MINS = 60  # Fresh news every hour
+OVERNIGHT_CHECK_HOURS = 4  # Overnight analysis every 4 hours
 # Market hours (Central time)
 MARKET_OPEN_HOUR = 8  # 8:30am CT but we start checking at 8
 MARKET_CLOSE_HOUR = 15  # 3:00pm CT (4pm ET)
