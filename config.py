@@ -14,6 +14,7 @@ ALPACA_DATA_URL = "https://data.alpaca.markets"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
 # ============================================================
 # TRADING MODE

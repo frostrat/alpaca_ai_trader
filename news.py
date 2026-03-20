@@ -336,7 +336,6 @@ NEWS:
         raw = data["content"][0][
             "text"
         ].strip()  # get rid of extra crud when printing a response
-        log.info(f"Raw Claude response: {raw[:500]}")
         if raw.startswith("```"):  # more to help with JSON formatting craziness
             raw = raw.split("```")[1]
             if raw.startswith("json"):

@@ -135,6 +135,22 @@ class ClaudeStrategy:
             row = df.iloc[-1]
             snapshots[symbol] = self._format_indicators(symbol, row, news_analysis)
 
+        """Step 2.5: also build snapshots for held positions that arent in the news picks.
+        if we own CRWD but news moved on to META, we still need claude to see CRWD
+        and decide whether to HOLD or SELL it."""
+        if positions:
+            for p in positions:
+                sym = p.get("symbol", "")
+                if sym and sym not in snapshots:
+                    df = market_data.get(sym)
+                    if df is not None and len(df) >= 50:
+                        row = df.iloc[-1]
+                        snapshots[sym] = self._format_indicators(
+                            sym, row, news_analysis
+                        )
+                        # mark it so claude knows this isnt a news pick
+                        snapshots[sym]["sector"] = "Held (not in current news)"
+
         if not snapshots:
             log.warning("No technical data available for any tickers")
             return {}
@@ -162,9 +178,17 @@ class ClaudeStrategy:
         """Step 4: load past trade history- enabling claude to learn from prev wins/losses"""
         recent_trades = self._load_trade_history()
 
-        """Step 5: builds prompt with everything combined and calls claude- verbose controls printing between the
+        """Step 5: grabs previous signals so claude can see what he said last time- 
+        keeps him from flip flopping without a good reason"""
+        previous_signals_text = "No previous signals."
+        if self._signals:
+            previous_signals_text = json.dumps(self._signals, indent=2)
+
+        """Step 6: builds prompt with everything combined and calls claude- verbose controls printing between the
          5min and 30 min checks (30min is the only checks that print besides when a buy goes through.) """
-        prompt = self._build_prompt(snapshots, news_analysis, recent_trades)
+        prompt = self._build_prompt(
+            snapshots, news_analysis, recent_trades, previous_signals_text
+        )
         signals = self._call_claude(prompt, verbose)
 
         if signals:
@@ -229,7 +253,9 @@ class ClaudeStrategy:
     # prompt builder
     # ============================================================
 
-    def _build_prompt(self, snapshots, news_analysis, trade_history) -> str:
+    def _build_prompt(
+        self, snapshots, news_analysis, trade_history, previous_signals_text
+    ) -> str:
         """Build the full chained analysis prompt."""
         data_text = json.dumps(snapshots, indent=2)
 
@@ -258,14 +284,20 @@ class ClaudeStrategy:
         return f"""You are a stock trading analyst managing a real portfolio on Alpaca. You receive:
 1. News sentiment analysis per sector (already analyzed)
 2. Technical indicators for the top stock in each sector
-3. Current position information
+3. Current position information (INCLUDING held stocks not in current news picks)
 4. Recent trade history (your past decisions and outcomes)
+5. Your previous signals (what you said last time)
 
 ANALYZE IN THIS ORDER:
 Step 1: Review the news sentiment and market overview.
 Step 2: Check if the technicals CONFIRM the news sentiment for each stock.
 Step 3: Review positions and trade history for context.
-Step 4: Make your final decision per stock.
+Step 4: Review your previous signals for consistency.
+Step 5: Make your final decision per stock.
+
+IMPORTANT: You may see stocks marked as "Held (not in current news)" — these are positions
+we currently own but the news cycle moved on to different tickers. You MUST still analyze
+these and decide HOLD or SELL. Do NOT ignore held positions just because theyre not in the headlines.
 
 ACTIONS (one per stock):
 - BUY: NOT holding. Technicals confirm bullish news. Strong setup.
@@ -284,6 +316,8 @@ RULES:
 - WAIT is always safer than a bad BUY.
 - Learn from trade history. If similar setups lost money before, be cautious.
 - Confidence = how strongly ALL signals align (0.0 = none, 1.0 = everything aligns).
+- CONSISTENCY: review your previous signals below. If conditions havent changed much, keep your previous call. Dont flip between BUY and WAIT without a clear reason. If you change your mind, explain what changed.
+- If market sentiment is BEARISH, do NOT open new positions. Only HOLD or SELL existing ones. Wait for neutral or bullish conditions before buying.
 
 INDICATOR GUIDE:
 - RSI < 30 = oversold (potential buy), RSI > 70 = overbought (avoid)
@@ -300,10 +334,13 @@ NEWS SENTIMENT:
 TECHNICAL DATA + POSITIONS:
 {data_text}
 
+YOUR PREVIOUS SIGNALS (what you said last time — be consistent unless something changed):
+{previous_signals_text}
+
 TRADE HISTORY:
 {history_text}
 
-Respond ONLY with JSON, no markdown, no extra text. Use the stock ticker as the key:
+Respond ONLY with JSON, no markdown, no extra text. Include ALL stocks shown above (including held positions):
 {{
   "TICKER1": {{
     "action": "buy/wait/hold/sell",
@@ -311,11 +348,6 @@ Respond ONLY with JSON, no markdown, no extra text. Use the stock ticker as the 
     "reasoning": "2-3 sentences: technicals + news alignment + decision"
   }},
   "TICKER2": {{
-    "action": "buy/wait/hold/sell",
-    "confidence": 0.0 to 1.0,
-    "reasoning": "..."
-  }},
-  "TICKER3": {{
     "action": "buy/wait/hold/sell",
     "confidence": 0.0 to 1.0,
     "reasoning": "..."
